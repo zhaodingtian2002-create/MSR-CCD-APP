@@ -7,8 +7,6 @@ from plotly.subplots import make_subplots
 import os
 from glob import glob
 import re
-import folium
-from streamlit_folium import st_folium
 
 # Set page configuration (must be at the top)
 st.set_page_config(
@@ -204,14 +202,10 @@ def create_dashboard(results, result_df, natural_df, human_df):
         st.metric("📈 Max Coordination D", f"{result_df['coordination_D'].max():.3f}")
     with col4:
         st.metric("📉 Min Coordination D", f"{result_df['coordination_D'].min():.3f}")
-    #tab layout
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "📊 Ranking", 
-        "🗺️ Scatter Analysis", 
-        "📈 Weight Analysis", 
-        "🔬 Detailed Data", 
-        "📋 Raw Data",
-        "🗺️ Interactive Map"  # 新增
+    
+    # Tab layout
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Ranking", "🗺️ Scatter Analysis", "📈 Weight Analysis", "🔬 Detailed Data", "📋 Raw Data"
     ])
     
     # ========== Tab 1: Ranking ==========
@@ -576,165 +570,7 @@ def create_dashboard(results, result_df, natural_df, human_df):
                 file_name="msr_raw_data.csv",
                 mime="text/csv"
             )
-        # ========== Tab 6: Interactive Map ==========
-    with tab6:
-        st.subheader("🗺️ Interactive CCD Map")
-        st.markdown("Click on any marker to view detailed CCD information")
-        
-        # 根据 CCD 值分类
-        def classify_ccd(d):
-            if d >= 0.7:
-                return "High Coordination (D ≥ 0.7)", "#2ecc71"
-            elif d >= 0.5:
-                return "Medium Coordination (0.5 ≤ D < 0.7)", "#f39c12"
-            else:
-                return "Low Coordination (D < 0.5)", "#e74c3c"
-        
-        # 添加分类列
-        map_df = result_df.copy()
-        map_df['ccd_category'], map_df['color'] = zip(*map_df['coordination_D'].apply(classify_ccd))
-        
-        # 加载坐标文件
-        coord_file = os.path.join(data_path, "countries_coordinates.csv")
-        
-        if os.path.exists(coord_file):
-            coords_df = pd.read_csv(coord_file)
-            
-            # 合并数据
-            map_data = map_df.merge(coords_df, left_on='country', right_on='country', how='inner')
-            
-            if len(map_data) > 0:
-                # 创建地图
-                m = folium.Map(
-                    location=[20, 0], 
-                    zoom_start=2, 
-                    tiles='CartoDB positron',
-                    control_scale=True
-                )
-                
-                # 添加标记点
-                for _, row in map_data.iterrows():
-                    # 计算标记大小（基于 CCD 值）
-                    radius = 6 + row['coordination_D'] * 12
-                    
-                    # 创建弹出信息
-                    popup_html = f"""
-                    <div style="width: 260px; padding: 12px;">
-                        <h4 style="color: {row['color']}; margin-bottom: 8px;">{row['country']}</h4>
-                        <hr style="margin: 5px 0;">
-                        <table style="width: 100%; font-size: 13px;">
-                            <tr><td><b>CCD Value:</b></td>
-                            <td style="text-align: right;"><b>{row['coordination_D']:.4f}</b></td>
-                            </tr>
-                            <tr><td><b>Category:</b></td>
-                            <td style="text-align: right; color: {row['color']};">{row['ccd_category']}</td>
-                            </tr>
-                            <tr><td><b>Geo Score:</b></td>
-                            <td style="text-align: right;">{row['geo_score']:.3f}</td>
-                            </tr>
-                            <tr><td><b>Socio Score:</b></td>
-                            <td style="text-align: right;">{row['socio_score']:.3f}</td>
-                            </tr>
-                            <tr><td><b>Coupling C:</b></td>
-                            <td style="text-align: right;">{row['coupling_C']:.3f}</td>
-                            </tr>
-                        </table>
-                    </div>
-                    """
-                    
-                    folium.CircleMarker(
-                        location=[row['latitude'], row['longitude']],
-                        radius=radius,
-                        popup=folium.Popup(popup_html, max_width=300),
-                        color=row['color'],
-                        fill=True,
-                        fill_color=row['color'],
-                        fill_opacity=0.7,
-                        weight=2,
-                        tooltip=f"{row['country']}: D={row['coordination_D']:.3f}"
-                    ).add_to(m)
-                
-                # 添加图例
-                legend_html = '''
-                <div style="position: fixed; bottom: 30px; right: 30px; z-index: 1000; 
-                            background-color: white; padding: 12px 18px; border-radius: 8px; 
-                            box-shadow: 0 2px 10px rgba(0,0,0,0.2); border-left: 4px solid #333;
-                            font-size: 13px;">
-                    <b>📊 CCD Classification</b><br>
-                    <span style="color: #2ecc71;">●</span> High Coordination (D ≥ 0.7)<br>
-                    <span style="color: #f39c12;">●</span> Medium Coordination (0.5 ≤ D < 0.7)<br>
-                    <span style="color: #e74c3c;">●</span> Low Coordination (D < 0.5)<br>
-                    <hr style="margin: 6px 0;">
-                    <span style="font-size: 11px;">● Marker size = CCD value</span>
-                </div>
-                '''
-                m.get_root().html.add_child(folium.Element(legend_html))
-                
-                # 显示地图
-                st_folium(m, width=800, height=550, returned_objects=[])
-                
-                # 显示统计
-                st.markdown("---")
-                st.subheader("📊 CCD Category Summary")
-                
-                col1, col2, col3 = st.columns(3)
-                counts = map_data['ccd_category'].value_counts()
-                
-                with col1:
-                    st.markdown(f"""
-                    <div style="background-color:#2ecc71; padding:15px; border-radius:10px; color:white; text-align:center">
-                        <h2>{counts.get('High Coordination (D ≥ 0.7)', 0)}</h2>
-                        <p>High Coordination</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col2:
-                    st.markdown(f"""
-                    <div style="background-color:#f39c12; padding:15px; border-radius:10px; color:white; text-align:center">
-                        <h2>{counts.get('Medium Coordination (0.5 ≤ D < 0.7)', 0)}</h2>
-                        <p>Medium Coordination</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                with col3:
-                    st.markdown(f"""
-                    <div style="background-color:#e74c3c; padding:15px; border-radius:10px; color:white; text-align:center">
-                        <h2>{counts.get('Low Coordination (D < 0.5)', 0)}</h2>
-                        <p>Low Coordination</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                
-                # 显示国家列表
-                with st.expander("📋 View Countries by Category"):
-                    for category in ['High Coordination (D ≥ 0.7)', 'Medium Coordination (0.5 ≤ D < 0.7)', 'Low Coordination (D < 0.5)']:
-                        countries_in_cat = map_data[map_data['ccd_category'] == category]['country'].tolist()
-                        if countries_in_cat:
-                            st.markdown(f"**{category}** ({len(countries_in_cat)} countries)")
-                            st.write(", ".join(countries_in_cat))
-                            st.markdown("---")
-                
-            else:
-                st.warning("No matching countries found between results and coordinates file.")
-                st.info("Please ensure country names in the coordinates file match the results.")
-        
-        else:
-            # 如果坐标文件不存在，显示提示并提供下载
-            st.warning("⚠️ Countries coordinates file not found!")
-            
-            st.markdown("""
-            ### How to set up the interactive map:
-            
-            1. **Download the template** below
-            2. **Fill in coordinates** for each country (get from Google Maps or [latlong.net](https://www.latlong.net/))
-            3. **Save as** `countries_coordinates.csv` in your data folder
-            4. **Rerun** the analysis
-            
-            ### Sample coordinate format:
-            ```csv
-            country,latitude,longitude
-            China,35.0,105.0
-            India,20.0,77.0
-            Indonesia,-0.8,113.2
+
 
 # ============================================================
 # Main Program
@@ -743,7 +579,7 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>page_icon, 21st Century Maritime Silk Road</h1>
+        <h1>🌊 21st Century Maritime Silk Road</h1>
         <h2>Coupling Coordination Analysis System (CCDM)</h2>
         <p>Geo-Environmental System | Socio-Economic System | Coordinated Development Assessment</p>
     </div>
