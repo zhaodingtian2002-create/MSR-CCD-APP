@@ -743,7 +743,7 @@ def main():
     # Header
     st.markdown("""
     <div class="main-header">
-        <h1>"🌊" 21st Century Maritime Silk Road</h1>
+        <h1>page_icon, 21st Century Maritime Silk Road</h1>
         <h2>Coupling Coordination Analysis System (CCDM)</h2>
         <p>Geo-Environmental System | Socio-Economic System | Coordinated Development Assessment</p>
     </div>
