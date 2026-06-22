@@ -1,730 +1,657 @@
-import streamlit as st
-import pandas as pd
+import os
+import re
+from glob import glob
+
+import folium
 import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import os
-from glob import glob
-import re
+import streamlit as st
+from streamlit_folium import st_folium
 
-# Set page configuration (must be at the top)
+
 st.set_page_config(
-    page_title="MSR Coupling Coordination Analysis System",
-    page_icon="🌊",
+    page_title="MSR Port Coupling Coordination Analysis",
+    page_icon="P",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom CSS styling
-st.markdown("""
+
+st.markdown(
+    """
 <style>
     .main-header {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 10px;
+        background: linear-gradient(135deg, #315f72 0%, #2f7d6f 55%, #d79b47 100%);
+        padding: 1.7rem 2rem;
+        border-radius: 8px;
         color: white;
-        text-align: center;
-        margin-bottom: 2rem;
+        margin-bottom: 1.5rem;
     }
-    .metric-card {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        text-align: center;
+    .main-header h1 {
+        margin: 0;
+        font-size: 2.15rem;
+        letter-spacing: 0;
+    }
+    .main-header p {
+        margin: .4rem 0 0 0;
+        opacity: .94;
+    }
+    .small-note {
+        color: #667085;
+        font-size: .9rem;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ============================================================
-# CCDM Model Class
-# ============================================================
+
+NATURAL_KEYWORDS = [
+    "slope",
+    "elev",
+    "elevation",
+    "bathy",
+    "bathymetry",
+    "evi",
+    "ndvi",
+    "rugged",
+    "terrain",
+    "coast",
+    "water",
+    "forest",
+    "grass",
+    "cropland",
+]
+
+NEGATIVE_INDICATORS = [
+    "so2",
+    "pollution",
+    "exposure",
+    "slope",
+    "rugged",
+    "tri",
+]
+
+
 class CouplingCoordinationModel:
     def __init__(self, alpha=0.5, beta=0.5):
         self.alpha = alpha
         self.beta = beta
-        
-    def min_max_normalize(self, data):
-        data = np.array(data, dtype=float)
-        min_val = np.nanmin(data)
-        max_val = np.nanmax(data)
-        if max_val - min_val == 0:
-            return np.ones_like(data) * 0.5
-        return (data - min_val) / (max_val - min_val)
-    
-    def entropy_weight_method(self, data_matrix):
-        n_samples, n_indicators = data_matrix.shape
+
+    @staticmethod
+    def min_max_normalize(data, positive=True):
+        values = np.array(data, dtype=float)
+        min_val = np.nanmin(values)
+        max_val = np.nanmax(values)
+        if np.isnan(min_val) or np.isnan(max_val) or max_val - min_val == 0:
+            return np.ones_like(values) * 0.5
+        norm = (values - min_val) / (max_val - min_val)
+        return norm if positive else 1 - norm
+
+    @staticmethod
+    def entropy_weight_method(data_matrix):
+        n_samples, _ = data_matrix.shape
+        if n_samples <= 1:
+            return np.ones(data_matrix.shape[1]) / data_matrix.shape[1]
         p_matrix = data_matrix / (np.sum(data_matrix, axis=0) + 1e-10)
         p_matrix = np.clip(p_matrix, 1e-10, 1 - 1e-10)
-        e_j = - (1 / np.log(n_samples)) * np.sum(p_matrix * np.log(p_matrix), axis=0)
+        e_j = -(1 / np.log(n_samples)) * np.sum(p_matrix * np.log(p_matrix), axis=0)
         d_j = 1 - e_j
-        weights = d_j / (np.sum(d_j) + 1e-10)
-        return weights
-    
-    def calculate_coupling_degree(self, f_score, g_score):
+        return d_j / (np.sum(d_j) + 1e-10)
+
+    @staticmethod
+    def calculate_coupling_degree(f_score, g_score):
         denominator = f_score + g_score
         if denominator == 0:
             return 0.0
-        return 2 * np.sqrt((f_score * g_score) / (denominator ** 2 + 1e-10))
-    
+        return 2 * np.sqrt((f_score * g_score) / (denominator**2 + 1e-10))
+
     def calculate_coordination_degree(self, f_score, g_score):
-        T = self.alpha * f_score + self.beta * g_score
-        C = self.calculate_coupling_degree(f_score, g_score)
-        return np.sqrt(C * T)
-    
-    def fit(self, geo_data, socio_data):
-        geo_df = geo_data if isinstance(geo_data, pd.DataFrame) else pd.DataFrame(geo_data)
-        socio_df = socio_data if isinstance(socio_data, pd.DataFrame) else pd.DataFrame(socio_data)
-        
-        geo_norm = geo_df.apply(lambda x: self.min_max_normalize(x))
-        socio_norm = socio_df.apply(lambda x: self.min_max_normalize(x))
-        
+        combined_score = self.alpha * f_score + self.beta * g_score
+        coupling = self.calculate_coupling_degree(f_score, g_score)
+        return np.sqrt(coupling * combined_score)
+
+    def fit(self, geo_data, socio_data, negative_columns=None):
+        negative_columns = set(negative_columns or [])
+        geo_df = geo_data.copy()
+        socio_df = socio_data.copy()
+
+        geo_norm = pd.DataFrame(index=geo_df.index)
+        for col in geo_df.columns:
+            geo_norm[col] = self.min_max_normalize(geo_df[col], positive=col not in negative_columns)
+
+        socio_norm = pd.DataFrame(index=socio_df.index)
+        for col in socio_df.columns:
+            socio_norm[col] = self.min_max_normalize(socio_df[col], positive=col not in negative_columns)
+
         geo_weights = self.entropy_weight_method(geo_norm.values)
         socio_weights = self.entropy_weight_method(socio_norm.values)
-        
+
         f_scores = np.sum(geo_norm.values * geo_weights, axis=1)
         g_scores = np.sum(socio_norm.values * socio_weights, axis=1)
-        
-        C_values = np.array([self.calculate_coupling_degree(f, g) for f, g in zip(f_scores, g_scores)])
-        D_values = np.array([self.calculate_coordination_degree(f, g) for f, g in zip(f_scores, g_scores)])
-        
+        coupling_values = np.array(
+            [self.calculate_coupling_degree(f, g) for f, g in zip(f_scores, g_scores)]
+        )
+        coordination_values = np.array(
+            [self.calculate_coordination_degree(f, g) for f, g in zip(f_scores, g_scores)]
+        )
+
         return {
-            'f_scores': f_scores, 'g_scores': g_scores,
-            'coupling_C': C_values, 'coordination_D': D_values,
-            'geo_weights': geo_weights, 'socio_weights': socio_weights,
-            'geo_columns': list(geo_df.columns), 'socio_columns': list(socio_df.columns),
-            'geo_norm': geo_norm, 'socio_norm': socio_norm
+            "f_scores": f_scores,
+            "g_scores": g_scores,
+            "coupling_C": coupling_values,
+            "coordination_D": coordination_values,
+            "geo_weights": geo_weights,
+            "socio_weights": socio_weights,
+            "geo_columns": list(geo_df.columns),
+            "socio_columns": list(socio_df.columns),
+            "geo_norm": geo_norm,
+            "socio_norm": socio_norm,
         }
-    
+
     @staticmethod
-    def get_level(D):
-        if D >= 0.9: return "Excellent Coordination"
-        if D >= 0.8: return "Good Coordination"
-        if D >= 0.7: return "Moderate Coordination"
-        if D >= 0.6: return "Primary Coordination"
-        if D >= 0.5: return "Barely Coordination"
-        if D >= 0.4: return "Near Disorder"
-        if D >= 0.3: return "Mild Disorder"
-        if D >= 0.2: return "Moderate Disorder"
+    def get_level(value):
+        if value >= 0.9:
+            return "Excellent Coordination"
+        if value >= 0.8:
+            return "Good Coordination"
+        if value >= 0.7:
+            return "Moderate Coordination"
+        if value >= 0.6:
+            return "Primary Coordination"
+        if value >= 0.5:
+            return "Barely Coordination"
+        if value >= 0.4:
+            return "Near Disorder"
+        if value >= 0.3:
+            return "Mild Disorder"
+        if value >= 0.2:
+            return "Moderate Disorder"
         return "Severe Disorder"
 
 
-# ============================================================
-# Data Loading Function (with caching)
-# ============================================================
-@st.cache_data
-def load_data(folder_path):
-    """Load all MSR CSV files"""
-    files = glob(os.path.join(folder_path, "MSR_*.csv"))
-    
-    if not files:
-        return None, None, None
-    
-    natural_list = []
-    human_list = []
-    all_countries = set()
-    
-    natural_keywords = ['slope', 'elev', 'bathy', 'evi', 'rugged', 'coast', 'terrain', 'ndvi']
-    
-    for file_path in files:
-        filename = os.path.basename(file_path)
-        match = re.search(r'MSR_(\w+)\.csv', filename, re.IGNORECASE)
-        if not match:
-            continue
-        
-        indicator = match.group(1).lower()
-        df = pd.read_csv(file_path)
-        df.columns = df.columns.str.lower().str.strip()
-        
-        if 'country_na' not in df.columns or 'mean' not in df.columns:
-            continue
-        
-        df['country_na'] = df['country_na'].astype(str).str.strip()
-        df = df[['country_na', 'mean']].copy()
-        df = df.rename(columns={'mean': indicator})
-        df = df.groupby('country_na', as_index=False).mean()
-        
-        all_countries.update(df['country_na'].tolist())
-        
-        is_natural = any(kw in indicator.lower() for kw in natural_keywords)
-        if is_natural:
-            natural_list.append(df)
-        else:
-            human_list.append(df)
-    
-    all_countries = sorted(list(all_countries))
-    
-    # Merge data
-    natural_df = pd.DataFrame({'country_na': all_countries})
-    for df in natural_list:
-        natural_df = natural_df.merge(df, on='country_na', how='left')
-    
-    human_df = pd.DataFrame({'country_na': all_countries})
-    for df in human_list:
-        human_df = human_df.merge(df, on='country_na', how='left')
-    
-    return natural_df, human_df, all_countries
+def clean_columns(df):
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+    return df
 
 
-@st.cache_data
-def run_ccdm_model(geo_df, socio_df, alpha, beta):
-    """Run CCDM model and cache results"""
-    model = CouplingCoordinationModel(alpha=alpha, beta=beta)
-    results = model.fit(geo_df, socio_df)
-    
-    # Build results table
-    levels = [model.get_level(d) for d in results['coordination_D']]
-    result_df = pd.DataFrame({
-        'country': geo_df.index,
-        'geo_score': results['f_scores'],
-        'socio_score': results['g_scores'],
-        'coupling_C': results['coupling_C'],
-        'coordination_D': results['coordination_D'],
-        'level': levels
-    }).sort_values('coordination_D', ascending=False).reset_index(drop=True)
-    
-    return results, result_df, model
+def find_port_column(df):
+    candidates = ["port_name", "port", "name", "portname", "harbor", "terminal"]
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
 
 
-# ============================================================
-# Visualization Function (with session_state persistence)
-# ============================================================
-def create_dashboard(results, result_df, natural_df, human_df):
-    """Create interactive dashboard"""
-    
-    # Metric cards
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("🌍 Number of Countries", len(result_df))
-    with col2:
-        st.metric("📊 Mean Coordination D", f"{result_df['coordination_D'].mean():.3f}")
-    with col3:
-        st.metric("📈 Max Coordination D", f"{result_df['coordination_D'].max():.3f}")
-    with col4:
-        st.metric("📉 Min Coordination D", f"{result_df['coordination_D'].min():.3f}")
-    
-    # Tab layout
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Ranking", "🗺️ Scatter Analysis", "📈 Weight Analysis", "🔬 Detailed Data", "📋 Raw Data"
-    ])
-    
-    # ========== Tab 1: Ranking ==========
-    with tab1:
-        st.subheader("🏆 Coupling Coordination Ranking")
-        
-        col_left, col_right = st.columns([3, 2])
-        
-        with col_left:
-            display_df = result_df[['country', 'coordination_D', 'level', 'geo_score', 'socio_score']].copy()
-            display_df.columns = ['Country', 'Coordination D', 'Level', 'Geo Score', 'Socio Score']
-            display_df = display_df.round(3)
-            
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                column_config={
-                    "Coordination D": st.column_config.ProgressColumn(
-                        "Coordination D",
-                        help="Coupling coordination degree value (0-1)",
-                        format="%.3f",
-                        min_value=0,
-                        max_value=1,
-                    ),
-                }
-            )
-        
-        with col_right:
-            level_counts = result_df['level'].value_counts()
-            colors = ['#2ecc71', '#27ae60', '#f1c40f', '#f39c12', '#e67e22', '#e74c3c', '#c0392b', '#8e44ad', '#34495e']
-            fig_pie = px.pie(
-                values=level_counts.values,
-                names=level_counts.index,
-                title="Coordination Level Distribution",
-                color_discrete_sequence=colors,
-                hole=0.4
-            )
-            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
-        
-        st.subheader("📊 Coordination D Ranking Bar Chart")
-        top_n = st.slider("Display Top N Countries", 5, 30, 15, key="top_n_slider")
-        
-        top_countries = result_df.head(top_n)
-        bar_colors = ['#2ecc71' if d >= 0.6 else '#f39c12' if d >= 0.4 else '#e74c3c' 
-                      for d in top_countries['coordination_D']]
-        
-        fig_bar = go.Figure(go.Bar(
-            x=top_countries['coordination_D'],
-            y=top_countries['country'],
-            orientation='h',
-            marker_color=bar_colors,
-            text=top_countries['coordination_D'].round(3),
-            textposition='outside'
-        ))
-        fig_bar.update_layout(
-            title=f"Top {top_n} Countries Coordination Ranking",
-            xaxis_title="Coupling Coordination Degree D",
-            yaxis_title="Country",
-            height=500,
-            xaxis_range=[0, 1]
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-    
-    # ========== Tab 2: Scatter Analysis ==========
-    with tab2:
-        st.subheader("🗺️ Geo-Economic System Analysis")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            highlight_country = st.selectbox(
-                "Highlight Country",
-                ["None"] + list(result_df['country'].values),
-                key="highlight_select"
-            )
-        with col2:
-            color_by = st.radio("Color By", ["Coordination Level", "Geo Score", "Socio Score"], horizontal=True, key="color_by_radio")
-        
-        scatter_df = result_df.copy()
-        
-        if color_by == "Coordination Level":
-            fig_scatter = px.scatter(
-                scatter_df,
-                x='geo_score',
-                y='socio_score',
-                size='coordination_D',
-                color='level',
-                hover_name='country',
-                text='country',
-                title="Geo-Environmental System vs Socio-Economic System",
-                labels={'geo_score': 'Geo-Environmental Score f(G)', 'socio_score': 'Socio-Economic Score g(S)'},
-                size_max=30,
-                color_discrete_sequence=px.colors.qualitative.Set2
-            )
-        else:
-            color_col = 'geo_score' if color_by == "Geo Score" else 'socio_score'
-            fig_scatter = px.scatter(
-                scatter_df,
-                x='geo_score',
-                y='socio_score',
-                size='coordination_D',
-                color=color_col,
-                color_continuous_scale='RdYlGn',
-                hover_name='country',
-                text='country',
-                title="Geo-Environmental System vs Socio-Economic System",
-                labels={'geo_score': 'Geo-Environmental Score f(G)', 'socio_score': 'Socio-Economic Score g(S)'},
-                size_max=30
-            )
-        
-        fig_scatter.add_hline(y=0.5, line_dash="dash", line_color="gray", opacity=0.5)
-        fig_scatter.add_vline(x=0.5, line_dash="dash", line_color="gray", opacity=0.5)
-        
-        if highlight_country != "None":
-            highlight_data = scatter_df[scatter_df['country'] == highlight_country]
-            fig_scatter.add_trace(go.Scatter(
-                x=highlight_data['geo_score'],
-                y=highlight_data['socio_score'],
-                mode='markers+text',
-                marker=dict(size=40, symbol='star', color='red'),
-                text=highlight_data['country'],
-                textposition='top center',
-                name=f"⭐ {highlight_country}"
-            ))
-        
-        fig_scatter.update_layout(height=500)
-        st.plotly_chart(fig_scatter, use_container_width=True)
-        
-        # Quadrant Analysis
-        st.subheader("📐 Quadrant Analysis")
-        
-        quadrant_df = result_df.copy()
-        quadrant_df['quadrant'] = np.where(
-            (quadrant_df['geo_score'] >= 0.5) & (quadrant_df['socio_score'] >= 0.5), "🟢 High-High (Coordinated Development)",
-            np.where((quadrant_df['geo_score'] >= 0.5) & (quadrant_df['socio_score'] < 0.5), "🟡 High-Low (Geo Advantage)",
-            np.where((quadrant_df['geo_score'] < 0.5) & (quadrant_df['socio_score'] >= 0.5), "🟠 Low-High (Economic Advantage)",
-                     "🔴 Low-Low (Dual Disadvantage)"))
-        )
-        
-        quadrant_counts = quadrant_df['quadrant'].value_counts()
-        
-        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
-        cols = [col_q1, col_q2, col_q3, col_q4]
-        for i, (quad, count) in enumerate(quadrant_counts.items()):
-            if i < 4:
-                with cols[i]:
-                    st.markdown(f"""
-                    <div class="metric-card">
-                        <h4>{quad}</h4>
-                        <h2>{count}</h2>
-                        <p>Countries</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-        
-        with st.expander("View Quadrant Country Details"):
-            for quad in quadrant_df['quadrant'].unique():
-                st.markdown(f"**{quad}**")
-                countries_in_quad = quadrant_df[quadrant_df['quadrant'] == quad]['country'].tolist()
-                st.write(", ".join(countries_in_quad))
-    
-    # ========== Tab 3: Weight Analysis ==========
-    with tab3:
-        st.subheader("⚖️ Indicator Weight Analysis")
-        
-        col_w1, col_w2 = st.columns(2)
-        
-        with col_w1:
-            geo_weights_df = pd.DataFrame({
-                'Indicator': results['geo_columns'],
-                'Weight': results['geo_weights']
-            }).sort_values('Weight', ascending=True)
-            
-            fig_geo = px.bar(
-                geo_weights_df,
-                x='Weight',
-                y='Indicator',
-                orientation='h',
-                title='Geo-Environmental System Weights',
-                color='Weight',
-                color_continuous_scale='Blues',
-                text='Weight'
-            )
-            fig_geo.update_traces(texttemplate='%{text:.3f}', textposition='outside')
-            fig_geo.update_layout(height=400)
-            st.plotly_chart(fig_geo, use_container_width=True)
-        
-        with col_w2:
-            socio_weights_df = pd.DataFrame({
-                'Indicator': results['socio_columns'],
-                'Weight': results['socio_weights']
-            }).sort_values('Weight', ascending=True)
-            
-            fig_socio = px.bar(
-                socio_weights_df,
-                x='Weight',
-                y='Indicator',
-                orientation='h',
-                title='Socio-Economic System Weights',
-                color='Weight',
-                color_continuous_scale='Reds',
-                text='Weight'
-            )
-            fig_socio.update_traces(texttemplate='%{text:.3f}', textposition='outside')
-            fig_socio.update_layout(height=400)
-            st.plotly_chart(fig_socio, use_container_width=True)
-        
-        st.subheader("📊 System Weight Comparison")
-        comparison_df = pd.DataFrame({
-            'Indicator': results['geo_columns'] + results['socio_columns'],
-            'Weight': list(results['geo_weights']) + list(results['socio_weights']),
-            'System': ['Geo System'] * len(results['geo_columns']) + ['Socio System'] * len(results['socio_columns'])
-        }).sort_values('Weight', ascending=False).head(10)
-        
-        fig_compare = px.bar(
-            comparison_df,
-            x='Weight',
-            y='Indicator',
-            color='System',
-            orientation='h',
-            title='Top 10 Influential Indicators',
-            color_discrete_map={'Geo System': '#3498db', 'Socio System': '#e74c3c'},
-            text='Weight'
-        )
-        fig_compare.update_traces(texttemplate='%{text:.3f}', textposition='outside')
-        fig_compare.update_layout(height=450)
-        st.plotly_chart(fig_compare, use_container_width=True)
-    
-    # ========== Tab 4: Detailed Data ==========
-    with tab4:
-        st.subheader("🔬 Detailed Indicator Data")
-        
-        # Get country list
-        country_list = result_df['country'].values.tolist()
-        
-        # Use session_state to keep selected country
-        if 'selected_country' not in st.session_state:
-            st.session_state.selected_country = country_list[0] if country_list else None
-        
-        # Create two-column layout
-        col_select, col_empty = st.columns([2, 3])
-        
-        with col_select:
-            # Country selector
-            selected_country = st.selectbox(
-                "Select Country to View Details",
-                country_list,
-                index=country_list.index(st.session_state.selected_country) if st.session_state.selected_country in country_list else 0,
-                key="country_selector",
-                on_change=None
-            )
-            # Update session_state
-            st.session_state.selected_country = selected_country
-        
-        # Get selected country data
-        country_data = result_df[result_df['country'] == selected_country].iloc[0]
-        
-        # Display metric cards
-        col_d1, col_d2, col_d3 = st.columns(3)
-        with col_d1:
-            st.metric("🌍 Coupling Coordination D", f"{country_data['coordination_D']:.4f}")
-            st.metric("🔗 Coupling Degree C", f"{country_data['coupling_C']:.4f}")
-        with col_d2:
-            st.metric("🗻 Geo-Environmental Score f(G)", f"{country_data['geo_score']:.4f}")
-            st.metric("💼 Socio-Economic Score g(S)", f"{country_data['socio_score']:.4f}")
-        with col_d3:
-            st.metric("📊 Coordination Type", country_data['level'])
-            rank = int(result_df[result_df['country'] == selected_country].index[0]) + 1
-            st.metric("📈 Rank", f"No. {rank}")
-        
-        # Radar chart
-        st.subheader(f"📡 {selected_country} Indicator Radar Chart")
-        
-        # Get normalized data
-        geo_norm_df = results['geo_norm']
-        socio_norm_df = results['socio_norm']
-        
-        if selected_country in geo_norm_df.index:
-            geo_values = geo_norm_df.loc[selected_country].values
-            socio_values = socio_norm_df.loc[selected_country].values
-        else:
-            geo_values = geo_norm_df.iloc[0].values
-            socio_values = socio_norm_df.iloc[0].values
-        
-        fig_radar = make_subplots(
-            rows=1, cols=2,
-            subplot_titles=("Geo-Environmental Indicators", "Socio-Economic Indicators"),
-            specs=[[{'type': 'polar'}, {'type': 'polar'}]]
-        )
-        
-        fig_radar.add_trace(go.Scatterpolar(
-            r=geo_values,
-            theta=results['geo_columns'],
-            fill='toself',
-            name=selected_country,
-            line_color='#3498db',
-            fillcolor='rgba(52, 152, 219, 0.3)'
-        ), row=1, col=1)
-        
-        fig_radar.add_trace(go.Scatterpolar(
-            r=socio_values,
-            theta=results['socio_columns'],
-            fill='toself',
-            name=selected_country,
-            line_color='#e74c3c',
-            fillcolor='rgba(231, 76, 60, 0.3)'
-        ), row=1, col=2)
-        
-        fig_radar.update_layout(height=500, showlegend=True)
-        st.plotly_chart(fig_radar, use_container_width=True)
-        
-        # Comparison with average
-        st.subheader("📊 Comparison with Average")
-        compare_data = pd.DataFrame({
-            'Indicator': ['Coordination D', 'Geo Score', 'Socio Score', 'Coupling C'],
-            selected_country: [
-                country_data['coordination_D'],
-                country_data['geo_score'],
-                country_data['socio_score'],
-                country_data['coupling_C']
-            ],
-            'Average': [
-                result_df['coordination_D'].mean(),
-                result_df['geo_score'].mean(),
-                result_df['socio_score'].mean(),
-                result_df['coupling_C'].mean()
-            ]
-        })
-        
-        fig_compare_country = go.Figure()
-        fig_compare_country.add_trace(go.Bar(
-            name=selected_country,
-            x=compare_data['Indicator'],
-            y=compare_data[selected_country],
-            marker_color='#3498db'
-        ))
-        fig_compare_country.add_trace(go.Bar(
-            name='Average',
-            x=compare_data['Indicator'],
-            y=compare_data['Average'],
-            marker_color='#95a5a6'
-        ))
-        fig_compare_country.update_layout(
-            title=f"{selected_country} vs All Countries Average",
-            yaxis_title="Value",
-            barmode='group'
-        )
-        st.plotly_chart(fig_compare_country, use_container_width=True)
-    
-    # ========== Tab 5: Raw Data ==========
-    with tab5:
-        st.subheader("📋 Raw Data")
-        
-        if natural_df is not None and human_df is not None:
-            merged_raw = natural_df.merge(human_df, on='country_na', how='outer')
-            merged_raw = merged_raw.fillna(0)
-            st.dataframe(merged_raw, use_container_width=True)
-            
-            csv = merged_raw.to_csv(index=False, encoding='utf-8-sig')
-            st.download_button(
-                label="📥 Download Raw Data (CSV)",
-                data=csv,
-                file_name="msr_raw_data.csv",
-                mime="text/csv"
-            )
+def safe_indicator_name(filename):
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    stem = re.sub(r"^(msr_|port_|ports_|msr_port_)", "", stem, flags=re.IGNORECASE)
+    return re.sub(r"[^0-9a-zA-Z_]+", "_", stem).strip("_").lower()
 
 
-# ============================================================
-# Main Program
-# ============================================================
-def main():
-    # Header
-    st.markdown("""
-    <div class="main-header">
-        <h1>🌊 21st Century Maritime Silk Road</h1>
-        <h2>Coupling Coordination Analysis System (CCDM)</h2>
-        <p>Geo-Environmental System | Socio-Economic System | Coordinated Development Assessment</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Sidebar
-    with st.sidebar:
-        st.image("https://img.icons8.com/color/96/000000/earth-planet.png", width=80)
-        st.title("⚙️ Control Panel")
-        
-        # Data path
-        data_path = st.text_input(
-            "📁 Data Folder Path",
-            value=".",
-            help="Folder containing MSR_*.csv files"
-        )
-        
-        # Model parameters
-        st.subheader("🎛️ Model Parameters")
-        alpha = st.slider("Geo-Environmental System Weight α", 0.0, 1.0, 0.5, 0.1, key="alpha_slider")
-        beta = st.slider("Socio-Economic System Weight β", 0.0, 1.0, 0.5, 0.1, key="beta_slider")
-        
-        # Run button
-        run_button = st.button("🚀 Run Analysis", type="primary", use_container_width=True)
-        
-        st.markdown("---")
-        st.markdown("""
-        **📖 Instructions**
-        - D ≥ 0.7: Good Coordination
-        - 0.5 ≤ D < 0.7: Barely Coordination  
-        - D < 0.5: Disorder State
-        """)
-    
-    # Use session_state to store analysis results
-    if 'analysis_done' not in st.session_state:
-        st.session_state.analysis_done = False
-    
-    # Main content
-    if run_button or st.session_state.analysis_done:
-        if run_button:
-            st.session_state.analysis_done = True
-        
-        with st.spinner("Loading data and running analysis..."):
-            try:
-                # Load data
-                natural_df, human_df, countries = load_data(data_path)
-                
-                if natural_df is None or human_df is None or len(natural_df) == 0:
-                    st.error("❌ Data files not found! Please ensure the folder contains MSR_*.csv files")
-                    st.info("Expected file name format: MSR_slope.csv, MSR_gdp.csv, etc.")
-                    st.session_state.analysis_done = False
-                    return
-                
-                # Prepare model input
-                geo_df = natural_df.set_index('country_na').fillna(0)
-                socio_df = human_df.set_index('country_na').fillna(0)
-                
-                # Run model (with caching)
-                results, result_df, model = run_ccdm_model(geo_df, socio_df, alpha, beta)
-                
-                # Store in session_state for recovery after rerun
-                st.session_state.results = results
-                st.session_state.result_df = result_df
-                st.session_state.natural_df = natural_df
-                st.session_state.human_df = human_df
-                
-                # Display success message
-                st.success(f"✅ Analysis complete! Total {len(result_df)} countries analyzed")
-                
-                # Create dashboard
-                create_dashboard(results, result_df, natural_df, human_df)
-                
-                # Download results
-                st.markdown("---")
-                col_d1, col_d2 = st.columns(2)
-                with col_d1:
-                    csv_results = result_df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(
-                        label="📥 Download Analysis Results (CSV)",
-                        data=csv_results,
-                        file_name="msr_ccdm_results.csv",
-                        mime="text/csv"
-                    )
-                with col_d2:
-                    report = f"""
-                    MSR Coupling Coordination Analysis Report
-                    ==========================================
-                    Total Countries Analyzed: {len(result_df)}
-                    Mean Coordination D: {result_df['coordination_D'].mean():.4f}
-                    Std Coordination D: {result_df['coordination_D'].std():.4f}
-                    Max Coordination D: {result_df.iloc[0]['country']} ({result_df.iloc[0]['coordination_D']:.4f})
-                    Min Coordination D: {result_df.iloc[-1]['country']} ({result_df.iloc[-1]['coordination_D']:.4f})
-                    
-                    Level Distribution:
-                    {result_df['level'].value_counts().to_string()}
-                    """
-                    st.download_button(
-                        label="📄 Download Analysis Report (TXT)",
-                        data=report,
-                        file_name="msr_ccdm_report.txt",
-                        mime="text/plain"
-                    )
-                
-            except Exception as e:
-                st.error(f"❌ Analysis error: {str(e)}")
-                st.exception(e)
-                st.session_state.analysis_done = False
+def is_negative_indicator(column_name):
+    name = column_name.lower()
+    return any(keyword in name for keyword in NEGATIVE_INDICATORS)
+
+
+def read_csv_any(source):
+    df = pd.read_csv(source)
+    return clean_columns(df)
+
+
+def extract_indicator_file(file_path):
+    df = read_csv_any(file_path)
+    port_col = find_port_column(df)
+    value_col = "mean" if "mean" in df.columns else None
+
+    if value_col is None:
+        numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in ["lat", "lon", "latitude", "longitude", "year"]]
+        if numeric_cols:
+            value_col = numeric_cols[0]
+
+    if not port_col or not value_col:
+        return None
+
+    indicator = safe_indicator_name(file_path)
+    out = df[[port_col, value_col]].copy()
+    out.columns = ["port_name", indicator]
+    out["port_name"] = out["port_name"].astype(str).str.strip()
+    out[indicator] = pd.to_numeric(out[indicator], errors="coerce")
+    return out.groupby("port_name", as_index=False).mean(numeric_only=True)
+
+
+def summarize_pollution(df, year_mode, value_mode):
+    df = clean_columns(df)
+    port_col = find_port_column(df)
+    if not port_col or "year" not in df.columns:
+        return None, None
+
+    pwe_col = "so2_population_weighted_exposure_mol_per_m2"
+    area_col = "so2_area_mean_mol_per_m2"
+    value_col = pwe_col if value_mode == "Population weighted exposure" and pwe_col in df.columns else area_col
+    if value_col not in df.columns:
+        numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != "year"]
+        if not numeric_cols:
+            return None, None
+        value_col = numeric_cols[0]
+
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=["year", value_col]).copy()
+    df["port_name"] = df[port_col].astype(str).str.strip()
+
+    if year_mode == "Latest year":
+        idx = df.groupby("port_name")["year"].idxmax()
+        indicator = df.loc[idx, ["port_name", value_col]].copy()
+    elif year_mode == "Mean across years":
+        indicator = df.groupby("port_name", as_index=False)[value_col].mean()
     else:
-        # Initial state
-        st.info("👈 Please set the data folder path on the left, then click 'Run Analysis'")
-        
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            ### Data Preparation
-            1. Name your data files in the format: `MSR_INDICATOR_NAME.csv`
-            2. Each CSV file must contain two columns:
-               - `country_na`: Country name
-               - `mean`: Indicator mean value
-            3. Place all files in the same folder
-            
-            ### Supported File Examples
-            - `MSR_slope.csv` (Slope)
-            - `MSR_elevation.csv` (Elevation)
-            - `MSR_bathymetry.csv` (Bathymetry)
-            - `MSR_evi.csv` (EVI - Vegetation Index)
-            - `MSR_gdp.csv` (GDP)
-            - `MSR_lsci.csv` (Liner Shipping Connectivity Index)
-            - `MSR_population.csv` (Population Density)
-            
-            ### Output Results
-            - Coupling coordination ranking
-            - Weight analysis
-            - Quadrant analysis
-            - Detailed country reports
-            """)
-        
-        if os.path.exists("."):
-            csv_files = glob("MSR_*.csv")
-            if csv_files:
-                st.success(f"Found {len(csv_files)} data files in current directory:")
-                for f in csv_files:
-                    st.write(f"  - {f}")
-            else:
-                st.warning("No MSR_*.csv files found in current directory")
+        selected_year = int(year_mode)
+        indicator = df[df["year"] == selected_year][["port_name", value_col]].copy()
+
+    indicator = indicator.rename(columns={value_col: "so2_exposure"})
+    return indicator.groupby("port_name", as_index=False).mean(numeric_only=True), df
+
+
+@st.cache_data(show_spinner=False)
+def load_port_data(folder_path, pollution_path, year_mode, value_mode):
+    patterns = ["MSR_Port_*.csv", "Port_*.csv", "Ports_*.csv"]
+    files = []
+    for pattern in patterns:
+        files.extend(glob(os.path.join(folder_path, pattern)))
+
+    indicator_frames = []
+    skipped_files = []
+    for file_path in sorted(set(files)):
+        if pollution_path and os.path.abspath(file_path) == os.path.abspath(pollution_path):
+            continue
+        extracted = extract_indicator_file(file_path)
+        if extracted is None:
+            skipped_files.append(os.path.basename(file_path))
+        else:
+            indicator_frames.append((safe_indicator_name(file_path), extracted))
+
+    pollution_long = None
+    if pollution_path and os.path.exists(pollution_path):
+        pollution_df = read_csv_any(pollution_path)
+        pollution_indicator, pollution_long = summarize_pollution(pollution_df, year_mode, value_mode)
+        if pollution_indicator is not None:
+            indicator_frames.append(("so2_exposure", pollution_indicator))
+
+    if not indicator_frames:
+        return None, None, None, None, skipped_files
+
+    all_ports = sorted(
+        set().union(*[set(frame["port_name"].dropna().astype(str)) for _, frame in indicator_frames])
+    )
+    merged = pd.DataFrame({"port_name": all_ports})
+    for _, frame in indicator_frames:
+        merged = merged.merge(frame, on="port_name", how="left")
+
+    natural_cols = [
+        col for col in merged.columns if col != "port_name" and any(k in col.lower() for k in NATURAL_KEYWORDS)
+    ]
+    socio_cols = [col for col in merged.columns if col != "port_name" and col not in natural_cols]
+
+    return merged, natural_cols, socio_cols, pollution_long, skipped_files
+
+
+@st.cache_data(show_spinner=False)
+def load_coordinates(folder_path):
+    coord_files = [
+        os.path.join(folder_path, "port_coordinates.csv"),
+        os.path.join(folder_path, "ports_coordinates.csv"),
+    ]
+    for path in coord_files:
+        if os.path.exists(path):
+            df = read_csv_any(path)
+            port_col = find_port_column(df)
+            lat_col = "latitude" if "latitude" in df.columns else "lat" if "lat" in df.columns else None
+            lon_col = "longitude" if "longitude" in df.columns else "lon" if "lon" in df.columns else None
+            if port_col and lat_col and lon_col:
+                out = df[[port_col, lat_col, lon_col]].copy()
+                out.columns = ["port_name", "latitude", "longitude"]
+                out["port_name"] = out["port_name"].astype(str).str.strip()
+                out["latitude"] = pd.to_numeric(out["latitude"], errors="coerce")
+                out["longitude"] = pd.to_numeric(out["longitude"], errors="coerce")
+                return out.dropna(subset=["latitude", "longitude"])
+    return None
+
+
+def run_model(merged, natural_cols, socio_cols, alpha, beta):
+    if not natural_cols or not socio_cols:
+        return None, None
+
+    model_input = merged.copy()
+    numeric_cols = natural_cols + socio_cols
+    for col in numeric_cols:
+        model_input[col] = pd.to_numeric(model_input[col], errors="coerce")
+
+    model_input[numeric_cols] = model_input[numeric_cols].fillna(model_input[numeric_cols].median())
+    model_input[numeric_cols] = model_input[numeric_cols].fillna(0)
+
+    geo_df = model_input.set_index("port_name")[natural_cols]
+    socio_df = model_input.set_index("port_name")[socio_cols]
+    negative_cols = [c for c in numeric_cols if is_negative_indicator(c)]
+
+    model = CouplingCoordinationModel(alpha=alpha, beta=beta)
+    results = model.fit(geo_df, socio_df, negative_columns=negative_cols)
+    result_df = pd.DataFrame(
+        {
+            "port_name": geo_df.index,
+            "geo_score": results["f_scores"],
+            "socio_score": results["g_scores"],
+            "coupling_C": results["coupling_C"],
+            "coordination_D": results["coordination_D"],
+            "level": [model.get_level(v) for v in results["coordination_D"]],
+        }
+    ).sort_values("coordination_D", ascending=False)
+
+    return results, result_df.reset_index(drop=True)
+
+
+def render_summary(result_df):
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Ports", len(result_df))
+    col2.metric("Mean D", f"{result_df['coordination_D'].mean():.3f}")
+    col3.metric("Max D", f"{result_df['coordination_D'].max():.3f}")
+    col4.metric("Min D", f"{result_df['coordination_D'].min():.3f}")
+
+
+def render_ranking(result_df):
+    col_left, col_right = st.columns([3, 2])
+    with col_left:
+        display = result_df[["port_name", "coordination_D", "level", "geo_score", "socio_score"]].copy()
+        display.columns = ["Port", "Coordination D", "Level", "Geo Score", "Socio Score"]
+        st.dataframe(
+            display.round(4),
+            use_container_width=True,
+            column_config={
+                "Coordination D": st.column_config.ProgressColumn(
+                    "Coordination D", min_value=0, max_value=1, format="%.3f"
+                )
+            },
+        )
+    with col_right:
+        counts = result_df["level"].value_counts()
+        fig = px.pie(values=counts.values, names=counts.index, hole=0.42, title="Coordination levels")
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    top_n = st.slider("Display top ports", 5, min(50, len(result_df)), min(15, len(result_df)))
+    top_df = result_df.head(top_n).sort_values("coordination_D")
+    fig_bar = px.bar(
+        top_df,
+        x="coordination_D",
+        y="port_name",
+        orientation="h",
+        color="level",
+        labels={"coordination_D": "Coordination D", "port_name": "Port"},
+        title="Top port ranking",
+    )
+    fig_bar.update_layout(height=max(420, top_n * 28), yaxis_title=None)
+    st.plotly_chart(fig_bar, use_container_width=True)
+
+
+def render_scatter(result_df):
+    fig = px.scatter(
+        result_df,
+        x="geo_score",
+        y="socio_score",
+        color="coordination_D",
+        size="coordination_D",
+        hover_name="port_name",
+        color_continuous_scale="Viridis",
+        labels={
+            "geo_score": "Geo-environmental score",
+            "socio_score": "Socio-economic / pollution score",
+            "coordination_D": "Coordination D",
+        },
+        title="Port system balance",
+    )
+    fig.add_vline(x=result_df["geo_score"].median(), line_dash="dash", line_color="#8a8f98")
+    fig.add_hline(y=result_df["socio_score"].median(), line_dash="dash", line_color="#8a8f98")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_weights(results):
+    weight_df = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "system": "Geo-environmental",
+                    "indicator": results["geo_columns"],
+                    "weight": results["geo_weights"],
+                }
+            ),
+            pd.DataFrame(
+                {
+                    "system": "Socio-economic / pollution",
+                    "indicator": results["socio_columns"],
+                    "weight": results["socio_weights"],
+                }
+            ),
+        ],
+        ignore_index=True,
+    )
+    fig = px.bar(weight_df, x="weight", y="indicator", color="system", orientation="h", title="Entropy weights")
+    fig.update_layout(yaxis_title=None, height=max(420, len(weight_df) * 32))
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(weight_df.round(5), use_container_width=True)
+
+
+def render_pollution(pollution_long):
+    if pollution_long is None or pollution_long.empty:
+        st.info("No port-year SO2 table was loaded.")
+        return
+
+    pwe_col = "so2_population_weighted_exposure_mol_per_m2"
+    area_col = "so2_area_mean_mol_per_m2"
+    available = [c for c in [pwe_col, area_col, "total_population"] if c in pollution_long.columns]
+    ports = sorted(pollution_long["port_name"].dropna().unique())
+    selected = st.multiselect("Ports", ports, default=ports[: min(5, len(ports))])
+    metric = st.selectbox("Metric", available)
+    plot_df = pollution_long[pollution_long["port_name"].isin(selected)]
+    fig = px.line(plot_df, x="year", y=metric, color="port_name", markers=True, title="Port-year pollution trend")
+    fig.update_layout(xaxis=dict(dtick=1), legend_title_text="Port")
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(plot_df.sort_values(["port_name", "year"]), use_container_width=True)
+
+
+def render_map(result_df, folder_path):
+    coords = load_coordinates(folder_path)
+    if coords is None:
+        st.warning("No port coordinate file found.")
+        st.markdown(
+            """
+Create `port_coordinates.csv` in the data folder with this format:
+
+```csv
+port_name,latitude,longitude
+Gwadar,25.1216,62.3254
+Singapore,1.2644,103.8223
+```
+"""
+        )
+        return
+
+    map_df = result_df.merge(coords, on="port_name", how="inner")
+    if map_df.empty:
+        st.warning("Coordinates were found, but no port names matched the analysis table.")
+        return
+
+    center = [map_df["latitude"].mean(), map_df["longitude"].mean()]
+    fmap = folium.Map(location=center, zoom_start=4, tiles="CartoDB positron", control_scale=True)
+    for _, row in map_df.iterrows():
+        color = "#218c74" if row["coordination_D"] >= 0.6 else "#d9902f" if row["coordination_D"] >= 0.4 else "#c0392b"
+        radius = 6 + float(row["coordination_D"]) * 13
+        popup_html = (
+            f"<b>{row['port_name']}</b><br>"
+            f"Coordination D: {row['coordination_D']:.3f}<br>"
+            f"Geo score: {row['geo_score']:.3f}<br>"
+            f"Socio score: {row['socio_score']:.3f}<br>"
+            f"Level: {row['level']}"
+        )
+        folium.CircleMarker(
+            location=[row["latitude"], row["longitude"]],
+            radius=radius,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.72,
+            popup=folium.Popup(popup_html, max_width=320),
+        ).add_to(fmap)
+
+    st_folium(fmap, width=1100, height=560, returned_objects=[])
+
+
+def render_raw(merged, result_df):
+    st.subheader("Merged indicator table")
+    st.dataframe(merged, use_container_width=True)
+    st.subheader("Model output")
+    st.dataframe(result_df, use_container_width=True)
+
+
+def main():
+    st.markdown(
+        """
+<div class="main-header">
+    <h1>21st Century Maritime Silk Road Port CCDM</h1>
+    <p>Port-scale coupling coordination analysis using GEE-derived indicators and SO2 exposure.</p>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.title("Control Panel")
+        data_path = st.text_input("Data folder", value=".")
+        pollution_path = st.text_input(
+            "SO2 port-year CSV",
+            value=os.path.join(data_path, "Ports_SO2_population_weighted_exposure_2018_2025.csv"),
+            help="Use the CSV exported by GEE_pollution.txt. Leave it as a path in this folder after exporting from Google Drive.",
+        )
+        value_mode = st.radio(
+            "SO2 indicator",
+            ["Population weighted exposure", "Area mean SO2"],
+            horizontal=False,
+        )
+        year_mode = st.selectbox(
+            "SO2 year aggregation",
+            ["Latest year", "Mean across years"] + [str(y) for y in range(2018, 2026)],
+        )
+        st.divider()
+        alpha = st.slider("Geo-environmental weight alpha", 0.0, 1.0, 0.5, 0.05)
+        beta = st.slider("Socio-economic / pollution weight beta", 0.0, 1.0, 0.5, 0.05)
+        run = st.button("Run port analysis", type="primary", use_container_width=True)
+
+        st.markdown(
+            """
+<p class="small-note">
+Accepted indicator files: <code>MSR_Port_*.csv</code>, <code>Port_*.csv</code>, or <code>Ports_*.csv</code>.
+Each file should contain a port name column and a numeric value column, preferably <code>mean</code>.
+</p>
+""",
+            unsafe_allow_html=True,
+        )
+
+    if not run and "port_result_df" not in st.session_state:
+        st.info("Set the data folder and SO2 CSV path, then click Run port analysis.")
+        st.markdown(
+            """
+Expected GEE pollution export columns:
+
+```csv
+port_name,year,start_date,end_date,population_year_used,SO2_area_mean_mol_per_m2,total_population,SO2_population_weighted_exposure_mol_per_m2
+```
+"""
+        )
+        return
+
+    with st.spinner("Loading port data and running CCDM..."):
+        merged, natural_cols, socio_cols, pollution_long, skipped = load_port_data(
+            data_path, pollution_path, year_mode, value_mode
+        )
+
+    if merged is None:
+        st.error("No port-level indicator data was found.")
+        st.info(
+            "Put the GEE SO2 export CSV in this folder, or add files like MSR_Port_Elevation.csv with port_name and mean columns."
+        )
+        return
+
+    if skipped:
+        st.warning(f"Skipped files without usable port/value columns: {', '.join(skipped)}")
+
+    if not natural_cols:
+        st.error("No geo-environmental port indicators were found.")
+        st.info("Natural indicators are detected from names such as elevation, slope, evi, water, forest, coast, terrain.")
+        return
+
+    if not socio_cols:
+        st.error("No socio-economic or pollution port indicators were found.")
+        st.info("Add at least one non-natural indicator, or load the GEE SO2 port-year export CSV.")
+        return
+
+    results, result_df = run_model(merged, natural_cols, socio_cols, alpha, beta)
+    if results is None:
+        st.error("The model could not run with the current indicator groups.")
+        return
+
+    st.session_state.port_result_df = result_df
+    st.success(f"Analysis complete: {len(result_df)} ports, {len(natural_cols)} geo indicators, {len(socio_cols)} socio/pollution indicators.")
+    render_summary(result_df)
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        ["Ranking", "Scatter", "Weights", "SO2 Trend", "Map", "Raw Data"]
+    )
+
+    with tab1:
+        render_ranking(result_df)
+    with tab2:
+        render_scatter(result_df)
+    with tab3:
+        render_weights(results)
+    with tab4:
+        render_pollution(pollution_long)
+    with tab5:
+        render_map(result_df, data_path)
+    with tab6:
+        render_raw(merged, result_df)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            "Download port CCDM results",
+            result_df.to_csv(index=False, encoding="utf-8-sig"),
+            file_name="msr_port_ccdm_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with col2:
+        report = f"""MSR Port Coupling Coordination Analysis Report
+Ports analyzed: {len(result_df)}
+Geo indicators: {', '.join(natural_cols)}
+Socio/pollution indicators: {', '.join(socio_cols)}
+Mean Coordination D: {result_df['coordination_D'].mean():.4f}
+Max Coordination D: {result_df.iloc[0]['port_name']} ({result_df.iloc[0]['coordination_D']:.4f})
+Min Coordination D: {result_df.iloc[-1]['port_name']} ({result_df.iloc[-1]['coordination_D']:.4f})
+
+Level distribution:
+{result_df['level'].value_counts().to_string()}
+"""
+        st.download_button(
+            "Download report",
+            report,
+            file_name="msr_port_ccdm_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
 
 if __name__ == "__main__":
     main()
+
